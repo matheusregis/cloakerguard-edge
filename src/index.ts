@@ -26,6 +26,7 @@ type DomainCfg = {
   whiteOrigin?: string;
   blackOrigin?: string;
   rules?: { uaBlock?: string };
+  status?: string;
 };
 
 const fetchFn: typeof fetch = globalThis.fetch.bind(globalThis);
@@ -58,28 +59,7 @@ const app = express();
 app.use(morgan("combined"));
 app.use(compression());
 
-// Health
-app.get("/__edge-check", (req, res) =>
-  res.json({ ok: true, host: req.headers.host })
-);
-
-// ⛔️ Pré-check: 404 se domínio não estiver configurado
-app.use(async (req, res, next) => {
-  const host = String(req.headers.host || "").toLowerCase();
-  const cfg = await resolveHost(host).catch(() => null);
-  if (!cfg) {
-    res.status(404).set("Cache-Control", "no-store")
-      .send(`<!doctype html><html><body>
-        <h1>Domain not configured</h1>
-        <p>${host} não está configurado no CloakerGuard.</p>
-      </body></html>`);
-    return;
-  }
-  (req as any)._edgeCfg = cfg; // salva pra usar no proxy
-  next();
-});
-
-// /api → sua API (mesma origem, sem CORS no front)
+// /api -> proxy direto para API_BASE (sem pré-check)
 app.use(
   "/api",
   createProxyMiddleware({
@@ -90,31 +70,70 @@ app.use(
   })
 );
 
-// Proxy principal (WHITE/BLACK) — hooks via `on` (v3)
+// health
+app.get("/__edge-check", (req, res) => {
+  res.json({ ok: true, host: req.headers.host });
+});
+
+// pré-check apenas para o resto
+app.use(async (req, res, next) => {
+  const host = String(req.headers.host || "").toLowerCase();
+  try {
+    const cfg = await resolveHost(host);
+    if (!cfg) {
+      res.status(404).set("Cache-Control", "no-store")
+        .send(`<!doctype html><html><body>
+          <h1>Domain not configured</h1>
+          <p>${host} não está configurado no CloakerGuard.</p>
+        </body></html>`);
+      return;
+    }
+    (req as any)._edgeCfg = cfg;
+    next();
+  } catch (e: any) {
+    console.error("resolveHost error:", e?.message || e);
+    res.status(502).send("Edge resolve error");
+  }
+});
+
+// proxy principal (white/black) + headers de debug
 const mainProxyOptions: Options = {
   router: (req: any) => {
     const host = String(req.headers.host || "").toLowerCase();
     const cfg: DomainCfg | undefined = req._edgeCfg;
-    if (!cfg) return DEFAULT_ORIGIN;
-
-    const target = isWhite(req, cfg) ? cfg.whiteOrigin : cfg.blackOrigin;
-    if (!target) return DEFAULT_ORIGIN;
-
-    // evita loop: se target.host == host do cliente, usa fallback
-    try {
-      const t = new URL(target);
-      if (t.host.toLowerCase() === host) return DEFAULT_ORIGIN;
-    } catch {
+    if (!cfg) {
+      req._edgeRoute = "fallback";
+      req._edgeTarget = DEFAULT_ORIGIN;
       return DEFAULT_ORIGIN;
     }
-    return target;
+
+    const white = isWhite(req as Request, cfg);
+    const target = white ? cfg.whiteOrigin : cfg.blackOrigin;
+    req._edgeRoute = white ? "white" : "black";
+    req._edgeTarget = target || DEFAULT_ORIGIN;
+
+    try {
+      if (target) {
+        const t = new URL(target);
+        if (t.host.toLowerCase() === host) {
+          req._edgeRoute = "loop-fallback";
+          req._edgeTarget = DEFAULT_ORIGIN;
+          return DEFAULT_ORIGIN;
+        }
+        return target;
+      }
+    } catch {
+      // cai no fallback
+    }
+    req._edgeRoute = "no-target-fallback";
+    req._edgeTarget = DEFAULT_ORIGIN;
+    return DEFAULT_ORIGIN;
   },
   changeOrigin: true,
   xfwd: true,
   selfHandleResponse: true,
   on: {
     proxyReq(proxyReq, req: any) {
-      // host do origin já foi setado internamente; reforça cabeçalhos de forward
       const destHost = (proxyReq as any).getHeader?.("host") as
         | string
         | undefined;
@@ -123,8 +142,9 @@ const mainProxyOptions: Options = {
       (proxyReq as any).setHeader("X-Forwarded-Host", clientHost);
       (proxyReq as any).setHeader("X-Forwarded-Proto", "https");
     },
-    proxyRes: responseInterceptor(async (buf) => {
-      // opcional: reescrever HTML/headers aqui
+    proxyRes: responseInterceptor(async (buf, _proxyRes, req: any, res) => {
+      res.setHeader("x-edge-route", req._edgeRoute || "unknown");
+      res.setHeader("x-edge-target", req._edgeTarget || "none");
       return buf as Buffer;
     }),
   },

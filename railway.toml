@@ -1,5 +1,6 @@
 [build]
-builder = "docker"
+builder = "nixpacks"
 
 [deploy]
-healthcheckPath = "/health"
+buildCommand = "yarn && yarn build"
+startCommand = "node dist/index.js"

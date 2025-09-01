@@ -9,6 +9,9 @@ import {
   createProxyMiddleware,
   responseInterceptor,
 } from "http-proxy-middleware";
+import { IncomingMessage, ServerResponse } from "http";
+import type { ClientRequest } from "http";
+import type { Socket } from "net";
 
 const PORT = Number(process.env.PORT || 8080);
 const API_BASE = process.env.API_BASE ?? "";
@@ -29,16 +32,24 @@ type DomainCfg = {
   status?: string;
 };
 
+type EdgeReq = Request & {
+  _edgeHost?: string;
+  _edgeCfg?: DomainCfg;
+  _edgeRoute?: string;
+  _edgeTarget?: string;
+};
+
 const fetchFn: typeof fetch = globalThis.fetch.bind(globalThis);
 const cache = new LRUCache<string, DomainCfg>({ max: 5000, ttl: CACHE_TTL });
 
-// pega host do cliente (X-Forwarded-Host > Host)
-function getClientHost(req: express.Request): string {
-  const xfwd = String(req.headers["x-forwarded-host"] || "")
-    .split(",")[0]
-    .trim();
-  const h = (xfwd || String(req.headers.host || "")).trim().toLowerCase();
-  return h.replace(/:\d+$/, "").replace(/^\[([^[\]]+)\](:\d+)?$/, "[$1]");
+// Prioriza X-Original-Host (CF Transform), depois X-Forwarded-Host, por fim Host
+function getClientHost(req: Request): string {
+  const xoh =
+    (req.headers["x-original-host"] as string) ||
+    (req.headers["x-forwarded-host"] as string)?.split(",")[0]?.trim() ||
+    (req.headers.host as string) ||
+    "";
+  return xoh.toLowerCase().trim().replace(/:\d+$/, "");
 }
 
 async function resolveHost(host: string): Promise<DomainCfg | null> {
@@ -66,10 +77,12 @@ function isWhite(req: Request, cfg: DomainCfg) {
 }
 
 const app = express();
+app.disable("x-powered-by");
+app.set("trust proxy", true);
 app.use(morgan("combined"));
 app.use(compression());
 
-// 1) /api -> proxy direto pra API (sem pré-check)
+// 1) /api -> proxy direto para API
 app.use(
   "/api",
   createProxyMiddleware({
@@ -77,15 +90,29 @@ app.use(
     changeOrigin: true,
     xfwd: true,
     pathRewrite: (p: string) => p.replace(/^\/api/, ""),
+    on: {
+      error: (
+        _err: Error,
+        _req: IncomingMessage,
+        res: ServerResponse | Socket
+      ) => {
+        if (res instanceof ServerResponse) {
+          res.writeHead(502, { "Content-Type": "text/plain" });
+          res.end("Edge -> API upstream error");
+        }
+      },
+    },
   })
 );
 
-// 2) health (sem pré-check)
+// 2) health/readiness
+app.get("/.well-known/healthz", (_req, res) => res.send("ok"));
+app.get("/.well-known/readyz", (_req, res) => res.send("ok"));
 app.get("/__edge-check", (req, res) => {
   res.json({ ok: true, host: getClientHost(req) });
 });
 
-// 3) pré-check pros demais caminhos
+// 3) pré-check de domínios
 app.use(async (req, res, next) => {
   const host = getClientHost(req);
   try {
@@ -98,8 +125,8 @@ app.use(async (req, res, next) => {
         </body></html>`);
       return;
     }
-    (req as any)._edgeHost = host; // host do cliente
-    (req as any)._edgeCfg = cfg; // config resolvida
+    (req as EdgeReq)._edgeHost = host;
+    (req as EdgeReq)._edgeCfg = cfg;
     next();
   } catch (e: any) {
     console.error("resolveHost error:", e?.message || e);
@@ -107,65 +134,92 @@ app.use(async (req, res, next) => {
   }
 });
 
-// 4) proxy principal (white/black) + headers de debug
-const mainProxyOptions: Options = {
+// 4) proxy principal
+type HpmOptions = Options & {
+  timeout?: number;
+  proxyTimeout?: number;
+};
+
+const mainProxyOptions: HpmOptions = {
   router: (req: any) => {
-    const clientHost = req._edgeHost || getClientHost(req);
-    const cfg: DomainCfg | undefined = req._edgeCfg;
+    const r = req as EdgeReq;
+    const clientHost = r._edgeHost || getClientHost(r);
+    const cfg: DomainCfg | undefined = r._edgeCfg;
 
     if (!cfg) {
-      req._edgeRoute = "fallback";
-      req._edgeTarget = DEFAULT_ORIGIN;
+      r._edgeRoute = "fallback";
+      r._edgeTarget = DEFAULT_ORIGIN;
       return DEFAULT_ORIGIN;
     }
 
-    const white = isWhite(req as Request, cfg);
+    const white = isWhite(r, cfg);
     const target = white ? cfg.whiteOrigin : cfg.blackOrigin;
-    req._edgeRoute = white ? "white" : "black";
-    req._edgeTarget = target || DEFAULT_ORIGIN;
+    r._edgeRoute = white ? "white" : "black";
+    r._edgeTarget = target || DEFAULT_ORIGIN;
 
     try {
       if (target) {
         const t = new URL(target);
-        // evita loop: destino não pode ser o mesmo host do cliente
+        if (!/^https?:$/.test(t.protocol)) throw new Error("bad scheme");
         if (t.host.toLowerCase() === clientHost) {
-          req._edgeRoute = "loop-fallback";
-          req._edgeTarget = DEFAULT_ORIGIN;
+          r._edgeRoute = "loop-fallback";
+          r._edgeTarget = DEFAULT_ORIGIN;
           return DEFAULT_ORIGIN;
         }
         return target;
       }
     } catch {
-      // cai no fallback
+      // fallback
     }
-    req._edgeRoute = "no-target-fallback";
-    req._edgeTarget = DEFAULT_ORIGIN;
+    r._edgeRoute = "no-target-fallback";
+    r._edgeTarget = DEFAULT_ORIGIN;
     return DEFAULT_ORIGIN;
   },
   changeOrigin: true,
   xfwd: true,
   selfHandleResponse: true,
+  timeout: 25_000,
+  proxyTimeout: 25_000,
+  ws: true, // se algum origin usar websockets
   on: {
-    proxyReq(proxyReq, req: any) {
-      // Host do origin (Vercel/Globo)
-      const destHost = (proxyReq as any).getHeader?.("host") as
-        | string
-        | undefined;
-      if (destHost) (proxyReq as any).setHeader("Host", destHost);
-
-      // Preserve o host do cliente para sua API/origins
-      (proxyReq as any).setHeader(
-        "X-Forwarded-Host",
-        req._edgeHost || getClientHost(req)
-      );
-      (proxyReq as any).setHeader("X-Forwarded-Proto", "https");
+    error: (
+      _err: Error,
+      _req: IncomingMessage,
+      res: ServerResponse | Socket
+    ) => {
+      if (res instanceof ServerResponse) {
+        res.writeHead(502, { "Content-Type": "text/plain" });
+        res.end("Edge upstream error");
+      }
     },
-    proxyRes: responseInterceptor(async (buf, _proxyRes, req: any, res) => {
-      res.setHeader("x-edge-route", req._edgeRoute || "unknown");
-      res.setHeader("x-edge-target", req._edgeTarget || "none");
-      res.setHeader("x-edge-host", req._edgeHost || getClientHost(req));
-      return buf as Buffer;
-    }),
+    proxyReq: (proxyReq: ClientRequest, req: IncomingMessage) => {
+      const r = req as EdgeReq;
+      const target = r._edgeTarget || DEFAULT_ORIGIN;
+      let destHost = "";
+      try {
+        destHost = new URL(target).host;
+      } catch {
+        destHost = "";
+      }
+      if (destHost) proxyReq.setHeader("Host", destHost);
+
+      const clientHost = r._edgeHost || getClientHost(r as any);
+      proxyReq.setHeader("X-Original-Host", clientHost);
+      proxyReq.setHeader("X-Forwarded-Host", clientHost);
+      proxyReq.setHeader(
+        "X-Forwarded-Proto",
+        (req as any).secure ? "https" : "http"
+      );
+    },
+    proxyRes: responseInterceptor(
+      async (buf, _proxyRes, req: IncomingMessage, res: ServerResponse) => {
+        const r = req as EdgeReq;
+        res.setHeader("x-edge-route", r._edgeRoute || "unknown");
+        res.setHeader("x-edge-target", r._edgeTarget || "none");
+        res.setHeader("x-edge-host", r._edgeHost || getClientHost(r as any));
+        return buf as Buffer;
+      }
+    ),
   },
 };
 

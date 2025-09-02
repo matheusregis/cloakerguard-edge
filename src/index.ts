@@ -247,6 +247,29 @@ const mainProxyOptions: HpmOptions = {
   },
 };
 
+app.get("/.well-known/acme-challenge/:token", async (req, res) => {
+  const host = getClientHost(req);
+  try {
+    const r = await fetch(
+      `${API_BASE}/domains/acme-http?host=${encodeURIComponent(host)}`,
+      {
+        headers: EDGE_TOKEN
+          ? { Authorization: `Bearer ${EDGE_TOKEN}` }
+          : undefined,
+      }
+    );
+    if (!r.ok) return res.status(404).end();
+    const data = await r.json(); // { body: string }
+    if (!data?.body) return res.status(404).end();
+
+    res.setHeader("Content-Type", "text/plain; charset=utf-8");
+    res.setHeader("Cache-Control", "no-store");
+    return res.status(200).send(data.body);
+  } catch {
+    return res.status(500).send("acme error");
+  }
+});
+
 app.use("/", createProxyMiddleware(mainProxyOptions));
 
 app.listen(PORT, () => console.log(`EDGE on :${PORT}`));

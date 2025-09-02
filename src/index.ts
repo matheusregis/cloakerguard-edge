@@ -82,6 +82,30 @@ app.set("trust proxy", true);
 app.use(morgan("combined"));
 app.use(compression());
 
+// --- ACME HTTP-01 dinâmico (para Cloudflare Custom Hostnames) ---
+app.get("/.well-known/acme-challenge/:token", async (req, res) => {
+  const host = getClientHost(req);
+  const token = req.params.token;
+  try {
+    const url = `${API_BASE}/acme/http-token?host=${encodeURIComponent(
+      host
+    )}&token=${encodeURIComponent(token)}`;
+    const r = await fetchFn(url, {
+      headers: EDGE_TOKEN
+        ? { Authorization: `Bearer ${EDGE_TOKEN}` }
+        : undefined,
+    });
+
+    if (r.status === 404) return res.status(404).end();
+    if (!r.ok) return res.status(502).end();
+
+    const body = await r.text();
+    res.type("text/plain").send(body);
+  } catch {
+    res.status(500).end();
+  }
+});
+
 // 1) /api -> proxy direto para API
 app.use(
   "/api",
@@ -180,7 +204,7 @@ const mainProxyOptions: HpmOptions = {
   selfHandleResponse: true,
   timeout: 25_000,
   proxyTimeout: 25_000,
-  ws: true, // se algum origin usar websockets
+  ws: true,
   on: {
     error: (
       _err: Error,

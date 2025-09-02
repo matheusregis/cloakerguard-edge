@@ -247,27 +247,27 @@ const mainProxyOptions: HpmOptions = {
   },
 };
 
-app.get("/.well-known/acme-challenge/:token", async (req, res) => {
-  const host = getClientHost(req);
-  try {
-    const r = await fetch(
-      `${API_BASE}/domains/acme-http?host=${encodeURIComponent(host)}`,
-      {
-        headers: EDGE_TOKEN
-          ? { Authorization: `Bearer ${EDGE_TOKEN}` }
-          : undefined,
-      }
-    );
-    if (!r.ok) return res.status(404).end();
-    const data = await r.json(); // { body: string }
-    if (!data?.body) return res.status(404).end();
+function loadAcmeMap(raw: string) {
+  const map: Record<string, string> = {};
+  raw
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .forEach((pair) => {
+      const [h, v] = pair.split("=");
+      if (h && v) map[h.trim().toLowerCase()] = v.trim();
+    });
+  return map;
+}
+const ACME_MAP = loadAcmeMap(process.env.ACME_HTTP_TOKENS || "");
 
-    res.setHeader("Content-Type", "text/plain; charset=utf-8");
-    res.setHeader("Cache-Control", "no-store");
-    return res.status(200).send(data.body);
-  } catch {
-    return res.status(500).send("acme error");
-  }
+app.get("/.well-known/acme-challenge/:token", (req, res) => {
+  const host = getClientHost(req);
+  const body = ACME_MAP[host];
+  if (!body) return res.status(404).end();
+  res.setHeader("Content-Type", "text/plain; charset=utf-8");
+  res.setHeader("Cache-Control", "no-store");
+  return res.status(200).send(body);
 });
 
 app.use("/", createProxyMiddleware(mainProxyOptions));

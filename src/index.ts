@@ -102,47 +102,27 @@ app.use(
 );
 app.use(compression());
 
-// --- ACME HTTP-01 (com LOG de tudo) ---
-app.get("/.well-known/acme-challenge/:token", async (req, res) => {
+app.all("/.well-known/acme-challenge/:token", async (req, res) => {
   const host = getClientHost(req);
   const token = req.params.token;
   try {
     const url = `${API_BASE}/acme/http-token?host=${encodeURIComponent(
       host
     )}&token=${encodeURIComponent(token)}`;
-
-    if (DEBUG)
-      console.log(
-        `[ACME IN] host=${host} token=${token} ua="${req.headers["user-agent"]}"`
-      );
-
     const r = await fetchFn(url, {
       headers: EDGE_TOKEN
         ? { Authorization: `Bearer ${EDGE_TOKEN}` }
         : undefined,
     });
-
-    if (DEBUG) console.log(`[ACME API] ${r.status} ${url}`);
-
-    if (r.status === 404) {
-      if (DEBUG) console.log(`[ACME OUT] 404 host=${host} token=${token}`);
-      return res.status(404).end();
-    }
-    if (!r.ok) {
-      if (DEBUG)
-        console.log(`[ACME OUT] 502 (api error) host=${host} token=${token}`);
-      return res.status(502).end();
-    }
-
+    if (r.status === 404) return res.status(404).end();
+    if (!r.ok) return res.status(502).end();
     const body = await r.text();
-    if (DEBUG) console.log(`[ACME BODY] "${body}"`);
-
     res.setHeader("Content-Type", "text/plain; charset=utf-8");
     res.setHeader("Cache-Control", "no-store");
-    res.setHeader("x-edge-debug", `acme host=${host}`);
+    // HEAD não tem corpo
+    if (req.method === "HEAD") return res.status(200).end();
     return res.status(200).send(body);
-  } catch (e: any) {
-    if (DEBUG) console.log(`[ACME EXCEPTION]`, e?.message || e);
+  } catch {
     return res.status(500).end();
   }
 });

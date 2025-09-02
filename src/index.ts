@@ -1,4 +1,3 @@
-// src/index.ts
 import "dotenv/config";
 import express, { Request } from "express";
 import compression from "compression";
@@ -18,6 +17,7 @@ const API_BASE = process.env.API_BASE ?? "";
 const EDGE_TOKEN = process.env.EDGE_TOKEN || "";
 const CACHE_TTL = Number(process.env.CACHE_TTL || 30) * 1000;
 const DEFAULT_ORIGIN = process.env.DEFAULT_ORIGIN || "https://example.com";
+const DEBUG = process.env.DEBUG_EDGE === "1";
 
 if (!API_BASE) {
   console.error("Missing env: API_BASE (ex: https://api.cloakerguard.com.br)");
@@ -55,16 +55,28 @@ function getClientHost(req: Request): string {
 async function resolveHost(host: string): Promise<DomainCfg | null> {
   const key = host.toLowerCase();
   const hit = cache.get(key);
-  if (hit) return hit;
+  if (hit) {
+    if (DEBUG) console.log(`[RESOLVE cache] ${key} ->`, hit);
+    return hit;
+  }
 
   const url = `${API_BASE}/domains/resolve?host=${encodeURIComponent(key)}`;
+  if (DEBUG) console.log(`[RESOLVE fetch] GET ${url}`);
   const r = await fetchFn(url, {
     headers: EDGE_TOKEN ? { Authorization: `Bearer ${EDGE_TOKEN}` } : undefined,
   });
-  if (r.status === 404) return null;
-  if (!r.ok) throw new Error(`resolve ${r.status}`);
+
+  if (r.status === 404) {
+    if (DEBUG) console.log(`[RESOLVE] 404 for host=${key}`);
+    return null;
+  }
+  if (!r.ok) {
+    if (DEBUG) console.log(`[RESOLVE] error status=${r.status}`);
+    throw new Error(`resolve ${r.status}`);
+  }
   const cfg = (await r.json()) as DomainCfg;
   cache.set(key, cfg);
+  if (DEBUG) console.log(`[RESOLVE ok] ${key} ->`, cfg);
   return cfg;
 }
 
@@ -79,10 +91,18 @@ function isWhite(req: Request, cfg: DomainCfg) {
 const app = express();
 app.disable("x-powered-by");
 app.set("trust proxy", true);
-app.use(morgan("combined"));
+
+// morgan com host/ua
+morgan.token("edge-host", (req) => getClientHost(req as any));
+morgan.token("ua", (req) => String(req.headers["user-agent"] || ""));
+app.use(
+  morgan(
+    ':method :url :status :res[content-length] - :response-time ms h=:edge-host ua=":ua"'
+  )
+);
 app.use(compression());
 
-// --- ACME HTTP-01 dinâmico (para Cloudflare Custom Hostnames) ---
+// --- ACME HTTP-01 (com LOG de tudo) ---
 app.get("/.well-known/acme-challenge/:token", async (req, res) => {
   const host = getClientHost(req);
   const token = req.params.token;
@@ -90,20 +110,52 @@ app.get("/.well-known/acme-challenge/:token", async (req, res) => {
     const url = `${API_BASE}/acme/http-token?host=${encodeURIComponent(
       host
     )}&token=${encodeURIComponent(token)}`;
+
+    if (DEBUG)
+      console.log(
+        `[ACME IN] host=${host} token=${token} ua="${req.headers["user-agent"]}"`
+      );
+
     const r = await fetchFn(url, {
       headers: EDGE_TOKEN
         ? { Authorization: `Bearer ${EDGE_TOKEN}` }
         : undefined,
     });
 
-    if (r.status === 404) return res.status(404).end();
-    if (!r.ok) return res.status(502).end();
+    if (DEBUG) console.log(`[ACME API] ${r.status} ${url}`);
+
+    if (r.status === 404) {
+      if (DEBUG) console.log(`[ACME OUT] 404 host=${host} token=${token}`);
+      return res.status(404).end();
+    }
+    if (!r.ok) {
+      if (DEBUG)
+        console.log(`[ACME OUT] 502 (api error) host=${host} token=${token}`);
+      return res.status(502).end();
+    }
 
     const body = await r.text();
-    res.type("text/plain").send(body);
-  } catch {
-    res.status(500).end();
+    if (DEBUG) console.log(`[ACME BODY] "${body}"`);
+
+    res.setHeader("Content-Type", "text/plain; charset=utf-8");
+    res.setHeader("Cache-Control", "no-store");
+    res.setHeader("x-edge-debug", `acme host=${host}`);
+    return res.status(200).send(body);
+  } catch (e: any) {
+    if (DEBUG) console.log(`[ACME EXCEPTION]`, e?.message || e);
+    return res.status(500).end();
   }
+});
+
+// Rota de debug para inspecionar headers recebidos
+app.get("/__echo", (req, res) => {
+  res.json({
+    ok: true,
+    hostDetectado: getClientHost(req),
+    method: req.method,
+    url: req.url,
+    headers: req.headers,
+  });
 });
 
 // 1) /api -> proxy direto para API
@@ -142,6 +194,7 @@ app.use(async (req, res, next) => {
   try {
     const cfg = await resolveHost(host);
     if (!cfg) {
+      if (DEBUG) console.log(`[PRECHECK] 404 host=${host}`);
       res.status(404).set("Cache-Control", "no-store")
         .send(`<!doctype html><html><body>
           <h1>Domain not configured</h1>
@@ -173,6 +226,8 @@ const mainProxyOptions: HpmOptions = {
     if (!cfg) {
       r._edgeRoute = "fallback";
       r._edgeTarget = DEFAULT_ORIGIN;
+      if (DEBUG)
+        console.log(`[ROUTER] ${clientHost} -> FALLBACK ${DEFAULT_ORIGIN}`);
       return DEFAULT_ORIGIN;
     }
 
@@ -188,8 +243,16 @@ const mainProxyOptions: HpmOptions = {
         if (t.host.toLowerCase() === clientHost) {
           r._edgeRoute = "loop-fallback";
           r._edgeTarget = DEFAULT_ORIGIN;
+          if (DEBUG)
+            console.log(
+              `[ROUTER] ${clientHost} -> LOOP-FALLBACK ${DEFAULT_ORIGIN}`
+            );
           return DEFAULT_ORIGIN;
         }
+        if (DEBUG)
+          console.log(
+            `[ROUTER] ${clientHost} uaRoute=${r._edgeRoute} -> ${target}`
+          );
         return target;
       }
     } catch {
@@ -197,6 +260,8 @@ const mainProxyOptions: HpmOptions = {
     }
     r._edgeRoute = "no-target-fallback";
     r._edgeTarget = DEFAULT_ORIGIN;
+    if (DEBUG)
+      console.log(`[ROUTER] ${clientHost} -> NO-TARGET ${DEFAULT_ORIGIN}`);
     return DEFAULT_ORIGIN;
   },
   changeOrigin: true,
@@ -246,29 +311,6 @@ const mainProxyOptions: HpmOptions = {
     ),
   },
 };
-
-function loadAcmeMap(raw: string) {
-  const map: Record<string, string> = {};
-  raw
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean)
-    .forEach((pair) => {
-      const [h, v] = pair.split("=");
-      if (h && v) map[h.trim().toLowerCase()] = v.trim();
-    });
-  return map;
-}
-const ACME_MAP = loadAcmeMap(process.env.ACME_HTTP_TOKENS || "");
-
-app.get("/.well-known/acme-challenge/:token", (req, res) => {
-  const host = getClientHost(req);
-  const body = ACME_MAP[host];
-  if (!body) return res.status(404).end();
-  res.setHeader("Content-Type", "text/plain; charset=utf-8");
-  res.setHeader("Cache-Control", "no-store");
-  return res.status(200).send(body);
-});
 
 app.use("/", createProxyMiddleware(mainProxyOptions));
 

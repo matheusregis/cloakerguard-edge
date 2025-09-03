@@ -17,7 +17,7 @@ const API_BASE = process.env.API_BASE ?? "";
 const EDGE_TOKEN = process.env.EDGE_TOKEN || "";
 const CACHE_TTL = Number(process.env.CACHE_TTL || 30) * 1000;
 const DEFAULT_ORIGIN = process.env.DEFAULT_ORIGIN || "https://example.com";
-const DEBUG = process.env.DEBUG_EDGE === "1";
+const DEBUG = true; // força debug sempre
 
 if (!API_BASE) {
   console.error("Missing env: API_BASE (ex: https://api.cloakerguard.com.br)");
@@ -54,29 +54,30 @@ function getClientHost(req: Request): string {
 
 async function resolveHost(host: string): Promise<DomainCfg | null> {
   const key = host.toLowerCase();
+  console.log(`[RESOLVE] start host=${key}`);
   const hit = cache.get(key);
   if (hit) {
-    if (DEBUG) console.log(`[RESOLVE cache] ${key} ->`, hit);
+    console.log(`[RESOLVE cache] ${key} ->`, hit);
     return hit;
   }
 
   const url = `${API_BASE}/domains/resolve?host=${encodeURIComponent(key)}`;
-  if (DEBUG) console.log(`[RESOLVE fetch] GET ${url}`);
+  console.log(`[RESOLVE fetch] GET ${url}`);
   const r = await fetchFn(url, {
     headers: EDGE_TOKEN ? { Authorization: `Bearer ${EDGE_TOKEN}` } : undefined,
   });
 
   if (r.status === 404) {
-    if (DEBUG) console.log(`[RESOLVE] 404 for host=${key}`);
+    console.log(`[RESOLVE] 404 for host=${key}`);
     return null;
   }
   if (!r.ok) {
-    if (DEBUG) console.log(`[RESOLVE] error status=${r.status}`);
+    console.log(`[RESOLVE] error status=${r.status}`);
     throw new Error(`resolve ${r.status}`);
   }
   const cfg = (await r.json()) as DomainCfg;
   cache.set(key, cfg);
-  if (DEBUG) console.log(`[RESOLVE ok] ${key} ->`, cfg);
+  console.log(`[RESOLVE ok] ${key} ->`, cfg);
   return cfg;
 }
 
@@ -85,7 +86,9 @@ function isWhite(req: Request, cfg: DomainCfg) {
   const re = cfg?.rules?.uaBlock
     ? new RegExp(cfg.rules.uaBlock, "i")
     : /(bot|crawler|spider|facebookexternalhit|headlesschrome)/i;
-  return re.test(ua);
+  const matched = re.test(ua);
+  console.log(`[UA CHECK] ua="${ua}" -> white=${matched}`);
+  return matched;
 }
 
 const app = express();
@@ -102,9 +105,20 @@ app.use(
 );
 app.use(compression());
 
+// log de entrada
+app.use((req, _res, next) => {
+  console.log(
+    `[EDGE] Incoming: host=${getClientHost(req)}, url=${req.url}, ua="${
+      req.headers["user-agent"]
+    }"`
+  );
+  next();
+});
+
 app.all("/.well-known/acme-challenge/:token", async (req, res) => {
   const host = getClientHost(req);
   const token = req.params.token;
+  console.log(`[ACME] host=${host}, token=${token}`);
   try {
     const url = `${API_BASE}/acme/http-token?host=${encodeURIComponent(
       host
@@ -114,20 +128,26 @@ app.all("/.well-known/acme-challenge/:token", async (req, res) => {
         ? { Authorization: `Bearer ${EDGE_TOKEN}` }
         : undefined,
     });
-    if (r.status === 404) return res.status(404).end();
-    if (!r.ok) return res.status(502).end();
+    if (r.status === 404) {
+      console.log(`[ACME] 404 token not found`);
+      return res.status(404).end();
+    }
+    if (!r.ok) {
+      console.log(`[ACME] error status=${r.status}`);
+      return res.status(502).end();
+    }
     const body = await r.text();
     res.setHeader("Content-Type", "text/plain; charset=utf-8");
     res.setHeader("Cache-Control", "no-store");
-    // HEAD não tem corpo
     if (req.method === "HEAD") return res.status(200).end();
     return res.status(200).send(body);
-  } catch {
+  } catch (e: any) {
+    console.error(`[ACME] error`, e);
     return res.status(500).end();
   }
 });
 
-// Rota de debug para inspecionar headers recebidos
+// Rota de debug
 app.get("/__echo", (req, res) => {
   res.json({
     ok: true,
@@ -138,60 +158,29 @@ app.get("/__echo", (req, res) => {
   });
 });
 
-// 1) /api -> proxy direto para API
-app.use(
-  "/api",
-  createProxyMiddleware({
-    target: API_BASE,
-    changeOrigin: true,
-    xfwd: true,
-    pathRewrite: (p: string) => p.replace(/^\/api/, ""),
-    on: {
-      error: (
-        _err: Error,
-        _req: IncomingMessage,
-        res: ServerResponse | Socket
-      ) => {
-        if (res instanceof ServerResponse) {
-          res.writeHead(502, { "Content-Type": "text/plain" });
-          res.end("Edge -> API upstream error");
-        }
-      },
-    },
-  })
-);
-
-// 2) health/readiness
-app.get("/.well-known/healthz", (_req, res) => res.send("ok"));
-app.get("/.well-known/readyz", (_req, res) => res.send("ok"));
-app.get("/__edge-check", (req, res) => {
-  res.json({ ok: true, host: getClientHost(req) });
-});
-
-// 3) pré-check de domínios
+// pré-check de domínios
 app.use(async (req, res, next) => {
   const host = getClientHost(req);
   try {
     const cfg = await resolveHost(host);
     if (!cfg) {
-      if (DEBUG) console.log(`[PRECHECK] 404 host=${host}`);
-      res.status(404).set("Cache-Control", "no-store")
-        .send(`<!doctype html><html><body>
-          <h1>Domain not configured</h1>
-          <p>${host} não está configurado no CloakerGuard.</p>
-        </body></html>`);
+      console.log(`[PRECHECK] host=${host} NOT CONFIGURED`);
+      res
+        .status(404)
+        .set("Cache-Control", "no-store")
+        .send(`<h1>Domain not configured</h1><p>${host}</p>`);
       return;
     }
     (req as EdgeReq)._edgeHost = host;
     (req as EdgeReq)._edgeCfg = cfg;
+    console.log(`[PRECHECK] host=${host} cfg ok`);
     next();
   } catch (e: any) {
-    console.error("resolveHost error:", e?.message || e);
+    console.error("[PRECHECK] resolve error:", e?.message || e);
     res.status(502).send("Edge resolve error");
   }
 });
 
-// 4) proxy principal
 type HpmOptions = Options & {
   timeout?: number;
   proxyTimeout?: number;
@@ -206,8 +195,7 @@ const mainProxyOptions: HpmOptions = {
     if (!cfg) {
       r._edgeRoute = "fallback";
       r._edgeTarget = DEFAULT_ORIGIN;
-      if (DEBUG)
-        console.log(`[ROUTER] ${clientHost} -> FALLBACK ${DEFAULT_ORIGIN}`);
+      console.log(`[ROUTER] ${clientHost} -> FALLBACK ${DEFAULT_ORIGIN}`);
       return DEFAULT_ORIGIN;
     }
 
@@ -223,25 +211,23 @@ const mainProxyOptions: HpmOptions = {
         if (t.host.toLowerCase() === clientHost) {
           r._edgeRoute = "loop-fallback";
           r._edgeTarget = DEFAULT_ORIGIN;
-          if (DEBUG)
-            console.log(
-              `[ROUTER] ${clientHost} -> LOOP-FALLBACK ${DEFAULT_ORIGIN}`
-            );
+          console.log(
+            `[ROUTER] ${clientHost} LOOP -> FALLBACK ${DEFAULT_ORIGIN}`
+          );
           return DEFAULT_ORIGIN;
         }
-        if (DEBUG)
-          console.log(
-            `[ROUTER] ${clientHost} uaRoute=${r._edgeRoute} -> ${target}`
-          );
+        console.log(
+          `[ROUTER] ${clientHost} uaRoute=${r._edgeRoute} -> ${target}`
+        );
         return target;
       }
-    } catch {
-      // fallback
+    } catch (e) {
+      console.log(`[ROUTER] ${clientHost} bad target: ${e}`);
     }
+
     r._edgeRoute = "no-target-fallback";
     r._edgeTarget = DEFAULT_ORIGIN;
-    if (DEBUG)
-      console.log(`[ROUTER] ${clientHost} -> NO-TARGET ${DEFAULT_ORIGIN}`);
+    console.log(`[ROUTER] ${clientHost} -> NO-TARGET ${DEFAULT_ORIGIN}`);
     return DEFAULT_ORIGIN;
   },
   changeOrigin: true,
@@ -251,11 +237,10 @@ const mainProxyOptions: HpmOptions = {
   proxyTimeout: 25_000,
   ws: true,
   on: {
-    error: (
-      _err: Error,
-      _req: IncomingMessage,
-      res: ServerResponse | Socket
-    ) => {
+    error: (err: Error, req: IncomingMessage, res: ServerResponse | Socket) => {
+      console.error(
+        `[PROXY ERROR] host=${getClientHost(req as any)} err=${err.message}`
+      );
       if (res instanceof ServerResponse) {
         res.writeHead(502, { "Content-Type": "text/plain" });
         res.end("Edge upstream error");
@@ -279,6 +264,8 @@ const mainProxyOptions: HpmOptions = {
         "X-Forwarded-Proto",
         (req as any).secure ? "https" : "http"
       );
+
+      console.log(`[PROXY REQ] ${clientHost} -> ${target} (Host=${destHost})`);
     },
     proxyRes: responseInterceptor(
       async (buf, _proxyRes, req: IncomingMessage, res: ServerResponse) => {
@@ -286,6 +273,9 @@ const mainProxyOptions: HpmOptions = {
         res.setHeader("x-edge-route", r._edgeRoute || "unknown");
         res.setHeader("x-edge-target", r._edgeTarget || "none");
         res.setHeader("x-edge-host", r._edgeHost || getClientHost(r as any));
+        console.log(
+          `[PROXY RES] host=${r._edgeHost} route=${r._edgeRoute} target=${r._edgeTarget}`
+        );
         return buf as Buffer;
       }
     ),
@@ -294,4 +284,4 @@ const mainProxyOptions: HpmOptions = {
 
 app.use("/", createProxyMiddleware(mainProxyOptions));
 
-app.listen(PORT, () => console.log(`EDGE on :${PORT}`));
+app.listen(PORT, () => console.log(`EDGE listening on :${PORT}`));

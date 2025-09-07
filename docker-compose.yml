@@ -2,8 +2,10 @@ version: "3.8"
 
 services:
   edge-proxy:
-    build: .
+    image: nginx:1.25
     container_name: edge-proxy
     ports:
-      - "8080:8080"   # 👈 expõe localmente na 8080
+      - "8080:8080" # Railway só expõe essa porta
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
     restart: always

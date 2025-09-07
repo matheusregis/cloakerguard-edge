@@ -1,11 +1,4 @@
-FROM node:20-alpine
-WORKDIR /app
-COPY package.json yarn.lock* package-lock.json* pnpm-lock.yaml* ./
-RUN yarn install
-COPY tsconfig.json ./
-COPY src ./src
-RUN yarn build
-RUN yarn install --production --ignore-scripts --prefer-offline
-ENV PORT=8080 NODE_ENV=production
+FROM nginx:1.25
+COPY nginx.conf /etc/nginx/nginx.conf
 EXPOSE 8080
-CMD ["node","dist/index.js"]
+CMD ["nginx", "-g", "daemon off;"]

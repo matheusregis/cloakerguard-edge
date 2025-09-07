@@ -1,6 +1,5 @@
 [build]
-builder = "nixpacks"
+builder = "DOCKERFILE"
 
 [deploy]
-buildCommand = "yarn && yarn build"
-startCommand = "node dist/index.js"
+startCommand = "nginx -g 'daemon off;'"

@@ -1,0 +1,9 @@
+version: "3.8"
+
+services:
+  edge-proxy:
+    build: .
+    container_name: edge-proxy
+    ports:
+      - "8080:8080"   # 👈 expõe localmente na 8080
+    restart: always
